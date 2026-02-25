@@ -1,14 +1,17 @@
 use crate::config::Config;
 use crate::state::{AppState, SubscribeResult};
+use smoltcp::wire::IpListenEndpoint;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+use tokio::task;
+use tokio::time::sleep;
 
-pub fn run(config: Config) -> io::Result<()> {
+pub async fn run(config: Config) -> io::Result<()> {
     let state = AppState::new(config);
 
     eprintln!(
@@ -20,13 +23,13 @@ pub fn run(config: Config) -> io::Result<()> {
 
     let mut bound = 0usize;
     for port in state.config.ports.clone() {
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
-        listener.set_nonblocking(true)?;
-        eprintln!("listening on 0.0.0.0:{port}");
+        let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+        let listen_endpoint: IpListenEndpoint = port.into();
+        eprintln!("listening on {listen_endpoint}");
         bound += 1;
 
         let shared = Arc::clone(&state);
-        thread::spawn(move || accept_loop(listener, shared));
+        tokio::spawn(accept_loop(listener, shared));
     }
 
     if bound == 0 {
@@ -37,7 +40,7 @@ pub fn run(config: Config) -> io::Result<()> {
     }
 
     loop {
-        thread::sleep(Duration::from_secs(60));
+        sleep(Duration::from_secs(60)).await;
         eprintln!(
             "status: {} source(s), {} client(s)",
             state.active_source_count(),
@@ -46,23 +49,31 @@ pub fn run(config: Config) -> io::Result<()> {
     }
 }
 
-fn accept_loop(listener: TcpListener, state: Arc<AppState>) {
+async fn accept_loop(listener: TcpListener, state: Arc<AppState>) {
     loop {
-        match listener.accept() {
+        match listener.accept().await {
             Ok((stream, addr)) => {
                 let shared = Arc::clone(&state);
-                thread::spawn(move || {
+                task::spawn_blocking(move || {
+                    let stream = match stream.into_std() {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            eprintln!("connection {addr}: failed to convert tokio stream: {err}");
+                            return;
+                        }
+                    };
+                    if let Err(err) = stream.set_nonblocking(false) {
+                        eprintln!("connection {addr}: failed to set blocking mode: {err}");
+                        return;
+                    }
                     if let Err(err) = handle_connection(stream, addr, shared) {
                         eprintln!("connection {addr}: {err}");
                     }
                 });
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
             Err(err) => {
                 eprintln!("accept error: {err}");
-                thread::sleep(Duration::from_millis(200));
+                sleep(Duration::from_millis(200)).await;
             }
         }
     }
@@ -317,7 +328,10 @@ fn handle_source(
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => source.broadcast(&buf[..n]),
+            Ok(n) => {
+                eprintln!("source {mount} read: {} bytes", buf.len());
+                source.broadcast(&buf[..n])
+            }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
             Err(err) if err.kind() == io::ErrorKind::TimedOut => continue,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -409,7 +423,10 @@ fn handle_source_post(
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => source.broadcast(&buf[..n]),
+            Ok(n) => {
+                eprintln!("source {mount} POST read: {} bytes", buf.len());
+                source.broadcast(&buf[..n])
+            }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
             Err(err) if err.kind() == io::ErrorKind::TimedOut => continue,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -519,6 +536,7 @@ fn write_401(stream: &mut TcpStream, realm: &str) -> io::Result<()> {
 }
 
 fn write_post_source_ok(stream: &mut TcpStream) -> io::Result<()> {
+    eprintln!("responding to POST source with HTTP 200 OK");
     stream.write_all(
         b"HTTP/1.1 200 OK\r\nServer: NTRIP NtripCaster-rs 0.1/2.0\r\nNtrip-Version: Ntrip/2.0\r\nConnection: close\r\n\r\n",
     )

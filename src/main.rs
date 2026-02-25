@@ -4,9 +4,10 @@ mod state;
 
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> ExitCode {
     match config::Config::load_from_cli() {
-        Ok(config) => match server::run(config) {
+        Ok(config) => match server::run(config).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("server error: {err}");
