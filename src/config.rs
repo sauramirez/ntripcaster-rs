@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub ports: Vec<u16>,
+    pub get_ports: Vec<u16>,
+    pub source_ports: Vec<u16>,
     pub max_clients: usize,
     pub max_clients_per_source: usize,
     pub max_sources: usize,
@@ -27,7 +28,8 @@ impl Default for Config {
         let config_path = PathBuf::from("ntripcaster/conf/ntripcaster.conf");
         let sourcetable_path = PathBuf::from("ntripcaster/conf/sourcetable.dat");
         Self {
-            ports: vec![2101],
+            get_ports: vec![2101],
+            source_ports: vec![2101],
             max_clients: 100,
             max_clients_per_source: 100,
             max_sources: 40,
@@ -71,7 +73,8 @@ impl Config {
 
     fn apply_file(&mut self, path: &Path) -> io::Result<()> {
         let contents = fs::read_to_string(path)?;
-        self.ports.clear();
+        self.get_ports.clear();
+        self.source_ports.clear();
         for raw_line in contents.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -93,7 +96,18 @@ impl Config {
             match key {
                 "port" => {
                     if let Ok(port) = value.parse::<u16>() {
-                        self.ports.push(port);
+                        self.get_ports.push(port);
+                        self.source_ports.push(port);
+                    }
+                }
+                "get_port" | "listener_port" => {
+                    if let Ok(port) = value.parse::<u16>() {
+                        self.get_ports.push(port);
+                    }
+                }
+                "source_port" | "caster_port" => {
+                    if let Ok(port) = value.parse::<u16>() {
+                        self.source_ports.push(port);
                     }
                 }
                 "encoder_password" => self.encoder_password = value.to_string(),
@@ -122,8 +136,16 @@ impl Config {
             }
         }
 
-        if self.ports.is_empty() {
-            self.ports.push(2101);
+        if self.get_ports.is_empty() && self.source_ports.is_empty() {
+            self.get_ports.push(2101);
+            self.source_ports.push(2101);
+        } else {
+            if self.get_ports.is_empty() {
+                self.get_ports.push(2101);
+            }
+            if self.source_ports.is_empty() {
+                self.source_ports.push(2101);
+            }
         }
 
         Ok(())
@@ -209,6 +231,8 @@ fn resolve_sourcetable_path(config_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_mount_auth_line() {
@@ -224,5 +248,39 @@ mod tests {
         let mut cfg = Config::default();
         cfg.parse_mount_auth("/OPENMOUNT");
         assert!(!cfg.auth_mounts.contains_key("/OPENMOUNT"));
+    }
+
+    #[test]
+    fn parses_separate_get_and_source_ports() {
+        let mut cfg = Config::default();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ntripcaster-config-{unique}.conf"));
+        fs::write(&path, "get_port 2201\nget_port 2202\nsource_port 2301\n").expect("write config");
+
+        cfg.apply_file(&path).expect("apply config");
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(cfg.get_ports, vec![2201, 2202]);
+        assert_eq!(cfg.source_ports, vec![2301]);
+    }
+
+    #[test]
+    fn legacy_port_applies_to_both_roles() {
+        let mut cfg = Config::default();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ntripcaster-config-{unique}.conf"));
+        fs::write(&path, "port 2401\n").expect("write config");
+
+        cfg.apply_file(&path).expect("apply config");
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(cfg.get_ports, vec![2401]);
+        assert_eq!(cfg.source_ports, vec![2401]);
     }
 }

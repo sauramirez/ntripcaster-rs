@@ -11,25 +11,53 @@ use tokio::net::TcpListener;
 use tokio::task;
 use tokio::time::sleep;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerRole {
+    GetOnly,
+    SourceOnly,
+    Both,
+}
+
+impl ListenerRole {
+    fn allows_get(self) -> bool {
+        matches!(self, Self::GetOnly | Self::Both)
+    }
+
+    fn allows_source(self) -> bool {
+        matches!(self, Self::SourceOnly | Self::Both)
+    }
+
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Both, _) | (_, Self::Both) => Self::Both,
+            (Self::GetOnly, Self::SourceOnly) | (Self::SourceOnly, Self::GetOnly) => Self::Both,
+            (same, _) => same,
+        }
+    }
+}
+
 pub async fn run(config: Config) -> io::Result<()> {
     let state = AppState::new(config);
 
+    let listener_roles = build_listener_roles(&state.config);
+
     eprintln!(
-        "ntripcaster-rs starting: ports={:?} config={} sourcetable={}",
-        state.config.ports,
+        "ntripcaster-rs starting: get_ports={:?} source_ports={:?} config={} sourcetable={}",
+        state.config.get_ports,
+        state.config.source_ports,
         state.config.config_path.display(),
         state.config.sourcetable_path.display()
     );
 
     let mut bound = 0usize;
-    for port in state.config.ports.clone() {
+    for (port, role) in listener_roles {
         let listener = TcpListener::bind(("0.0.0.0", port)).await?;
         let listen_endpoint: IpListenEndpoint = port.into();
-        eprintln!("listening on {listen_endpoint}");
+        eprintln!("listening on {listen_endpoint} role={role:?}");
         bound += 1;
 
         let shared = Arc::clone(&state);
-        tokio::spawn(accept_loop(listener, shared));
+        tokio::spawn(accept_loop(listener, role, shared));
     }
 
     if bound == 0 {
@@ -49,7 +77,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     }
 }
 
-async fn accept_loop(listener: TcpListener, state: Arc<AppState>) {
+async fn accept_loop(listener: TcpListener, role: ListenerRole, state: Arc<AppState>) {
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
@@ -66,7 +94,7 @@ async fn accept_loop(listener: TcpListener, state: Arc<AppState>) {
                         eprintln!("connection {addr}: failed to set blocking mode: {err}");
                         return;
                     }
-                    if let Err(err) = handle_connection(stream, addr, shared) {
+                    if let Err(err) = handle_connection(stream, addr, role, shared) {
                         eprintln!("connection {addr}: {err}");
                     }
                 });
@@ -79,7 +107,12 @@ async fn accept_loop(listener: TcpListener, state: Arc<AppState>) {
     }
 }
 
-fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<AppState>) -> io::Result<()> {
+fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    role: ListenerRole,
+    state: Arc<AppState>,
+) -> io::Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
 
@@ -97,16 +130,49 @@ fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<AppState>) 
             .unwrap_or(&"<no user-agent>".to_string())
     );
     if req.first_line.starts_with("GET ") {
+        if !role.allows_get() {
+            let mut stream = reader.into_inner();
+            write_400(&mut stream)?;
+            return Ok(());
+        }
         handle_client_get(reader.into_inner(), req, addr, state)
     } else if req.first_line.starts_with("SOURCE ") {
+        if !role.allows_source() {
+            let mut stream = reader.into_inner();
+            write_text_line(&mut stream, "ERROR - SOURCE not allowed on this port")?;
+            return Ok(());
+        }
         handle_source(reader, req, addr, state)
     } else if req.first_line.starts_with("POST ") {
+        if !role.allows_source() {
+            let mut stream = reader.into_inner();
+            write_400(&mut stream)?;
+            return Ok(());
+        }
         handle_source_post(reader, req, addr, state)
     } else {
         let mut stream = reader.into_inner();
         write_400(&mut stream)?;
         Ok(())
     }
+}
+
+fn build_listener_roles(config: &Config) -> Vec<(u16, ListenerRole)> {
+    let mut ports: HashMap<u16, ListenerRole> = HashMap::new();
+    for &port in &config.get_ports {
+        ports.entry(port)
+            .and_modify(|role| *role = role.merge(ListenerRole::GetOnly))
+            .or_insert(ListenerRole::GetOnly);
+    }
+    for &port in &config.source_ports {
+        ports.entry(port)
+            .and_modify(|role| *role = role.merge(ListenerRole::SourceOnly))
+            .or_insert(ListenerRole::SourceOnly);
+    }
+
+    let mut out: Vec<_> = ports.into_iter().collect();
+    out.sort_by_key(|(port, _)| *port);
+    out
 }
 
 struct RequestHead {
